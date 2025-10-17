@@ -4,25 +4,16 @@ import json
 class QueryEngine:
     def __init__(self, db_manager):
         self.mongo_db = db_manager.mongo_db
-        self.redis_client = db_manager.redis_client
+        self.cassandra_session = db_manager.cassandra_session
 
     def query1_disease_profile(self, disease_id):
         """
         Query 1: Disease Profile
-        Uses MongoDB for simple lookup
+        Uses MONGODB (optimized for this simple lookup)
         """
-
-        # Check Redis cache first
-        cache_key = f"disease:profile:{disease_id}"
-        cached = self.redis_client.get(cache_key)
-
-        if cached:
-            print("  (from Redis cache)")
-            return json.loads(cached)
 
         print("  (from MongoDB)")
 
-        # Query MongoDB
         nodes_collection = self.mongo_db["nodes"]
         edges_collection = self.mongo_db["edges"]
 
@@ -31,7 +22,7 @@ class QueryEngine:
         if not disease:
             return None
 
-        # Get treating drugs (CtD or CpD relationships)
+        # Get treating drugs
         drug_edges = edges_collection.find(
             {"target": disease_id, "metaedge": {"$in": ["CtD", "CpD"]}}
         )
@@ -41,7 +32,7 @@ class QueryEngine:
             nodes_collection.find({"id": {"$in": drug_ids}}, {"name": 1, "_id": 0})
         )
 
-        # Get associated genes (DaG, DuG, DdG relationships)
+        # Get associated genes
         gene_edges = edges_collection.find(
             {"source": disease_id, "metaedge": {"$in": ["DaG", "DuG", "DdG"]}}
         )
@@ -51,7 +42,7 @@ class QueryEngine:
             nodes_collection.find({"id": {"$in": gene_ids}}, {"name": 1, "_id": 0})
         )
 
-        # Get anatomical locations (DlA relationships)
+        # Get anatomical locations
         anatomy_edges = edges_collection.find({"source": disease_id, "metaedge": "DlA"})
 
         anatomy_ids = [edge["target"] for edge in anatomy_edges]
@@ -59,7 +50,6 @@ class QueryEngine:
             nodes_collection.find({"id": {"$in": anatomy_ids}}, {"name": 1, "_id": 0})
         )
 
-        # Build result
         profile = {
             "disease_id": disease_id,
             "disease_name": disease.get("name"),
@@ -68,91 +58,99 @@ class QueryEngine:
             "anatomies": [a["name"] for a in anatomies],
         }
 
-        # Cache the result
-        self.redis_client.set(cache_key, json.dumps(profile))
-
         return profile
 
     def query2_drug_repurposing(self, disease_id):
         """
         Query 2: Drug Repurposing
-        Uses MongoDB with multi-step queries
+        Uses CASSANDRA (demonstrates column-family querying)
         """
 
-        # Check Redis cache
-        cache_key = f"drug:repurposing:{disease_id}"
-        cached = self.redis_client.get(cache_key)
+        print("  (from Cassandra)")
 
-        if cached:
-            print("  (from Redis cache)")
-            return json.loads(cached)
-
-        print("  (from MongoDB)")
-
-        nodes_collection = self.mongo_db["nodes"]
-        edges_collection = self.mongo_db["edges"]
-
-        # Step 1: Get anatomies where disease occurs (Disease -DlA-> Anatomy)
-        anatomy_edges = edges_collection.find({"source": disease_id, "metaedge": "DlA"})
-        anatomy_ids = [edge["target"] for edge in anatomy_edges]
+        # Step 1: Get anatomies where disease occurs
+        anatomy_query = """
+            SELECT target FROM edges 
+            WHERE source = %s AND metaedge = 'DlA'
+            ALLOW FILTERING
+        """
+        anatomy_rows = self.cassandra_session.execute(anatomy_query, [disease_id])
+        anatomy_ids = [row.target for row in anatomy_rows]
 
         if not anatomy_ids:
             return []
 
-        # Step 2: Get genes that anatomies regulate (Anatomy -AdG/AuG-> Gene)
-        anatomy_gene_edges = list(
-            edges_collection.find(
-                {"source": {"$in": anatomy_ids}, "metaedge": {"$in": ["AdG", "AuG"]}}
-            )
-        )
+        # Step 2: Get genes regulated by anatomies
+        anatomy_gene_map = {}
+
+        for anatomy_id in anatomy_ids:
+            gene_query = """
+                SELECT target, metaedge FROM edges 
+                WHERE source = %s AND metaedge IN ('AdG', 'AuG')
+                ALLOW FILTERING
+            """
+            gene_rows = self.cassandra_session.execute(gene_query, [anatomy_id])
+
+            for row in gene_rows:
+                if row.target not in anatomy_gene_map:
+                    anatomy_gene_map[row.target] = []
+                anatomy_gene_map[row.target].append(row.metaedge)
 
         # Step 3: Find compounds with opposite regulation
         candidates = set()
 
-        for ag_edge in anatomy_gene_edges:
-            gene_id = ag_edge["target"]
-            anatomy_regulation = ag_edge["metaedge"]  # 'AdG' or 'AuG'
-
-            # Find compounds that regulate this gene in OPPOSITE way
-            if anatomy_regulation == "AdG":
-                # Anatomy down-regulates, find compounds that UP-regulate
-                compound_edges = edges_collection.find(
-                    {"target": gene_id, "metaedge": "CuG"}
+        for gene_id, regulations in anatomy_gene_map.items():
+            # If anatomy down-regulates, find compounds that up-regulate
+            if "AdG" in regulations:
+                compound_query = """
+                    SELECT source FROM edges 
+                    WHERE target = %s AND metaedge = 'CuG'
+                    ALLOW FILTERING
+                """
+                compound_rows = self.cassandra_session.execute(
+                    compound_query, [gene_id]
                 )
-            else:  # anatomy_regulation == 'AuG'
-                # Anatomy up-regulates, find compounds that DOWN-regulate
-                compound_edges = edges_collection.find(
-                    {"target": gene_id, "metaedge": "CdG"}
+                candidates.update([row.source for row in compound_rows])
+
+            # If anatomy up-regulates, find compounds that down-regulate
+            if "AuG" in regulations:
+                compound_query = """
+                    SELECT source FROM edges 
+                    WHERE target = %s AND metaedge = 'CdG'
+                    ALLOW FILTERING
+                """
+                compound_rows = self.cassandra_session.execute(
+                    compound_query, [gene_id]
                 )
+                candidates.update([row.source for row in compound_rows])
 
-            for comp_edge in compound_edges:
-                compound_id = comp_edge["source"]
-
-                # Check this compound doesn't already treat the disease
-                existing_treatment = edges_collection.find_one(
-                    {
-                        "source": compound_id,
-                        "target": disease_id,
-                        "metaedge": {"$in": ["CtD", "CpD"]},
-                    }
-                )
-
-                if not existing_treatment:
-                    candidates.add(compound_id)
-
-        # Get compound names
-        result = []
+        # Step 4: Filter out existing treatments
+        filtered_candidates = []
         for compound_id in candidates:
-            compound = nodes_collection.find_one({"id": compound_id})
-            if compound:
-                result.append(
-                    {"compound_id": compound_id, "compound_name": compound["name"]}
+            treatment_query = """
+                SELECT * FROM edges 
+                WHERE source = %s AND target = %s AND metaedge IN ('CtD', 'CpD')
+                ALLOW FILTERING
+            """
+            treatment_rows = list(
+                self.cassandra_session.execute(
+                    treatment_query, [compound_id, disease_id]
                 )
+            )
+
+            if not treatment_rows:
+                # Get compound name
+                name_query = "SELECT name FROM nodes WHERE id = %s"
+                name_row = self.cassandra_session.execute(
+                    name_query, [compound_id]
+                ).one()
+
+                if name_row:
+                    filtered_candidates.append(
+                        {"compound_id": compound_id, "compound_name": name_row.name}
+                    )
 
         # Sort by name
-        result.sort(key=lambda x: x["compound_name"])
+        filtered_candidates.sort(key=lambda x: x["compound_name"])
 
-        # Cache the result
-        self.redis_client.set(cache_key, json.dumps(result))
-
-        return result
+        return filtered_candidates
