@@ -2,17 +2,14 @@ import json
 
 
 class QueryEngine:
-    def __init__(self, neo4j_driver, redis_client):
-        self.neo4j_driver = neo4j_driver
-        self.redis_client = redis_client
+    def __init__(self, db_manager):
+        self.mongo_db = db_manager.mongo_db
+        self.redis_client = db_manager.redis_client
 
     def query1_disease_profile(self, disease_id):
         """
-        Query 1: Given a disease id, return:
-        - Disease name
-        - Drugs that treat/palliate it
-        - Genes that cause it
-        - Anatomical locations where it occurs
+        Query 1: Disease Profile
+        Uses MongoDB for simple lookup
         """
 
         # Check Redis cache first
@@ -20,47 +17,66 @@ class QueryEngine:
         cached = self.redis_client.get(cache_key)
 
         if cached:
-            print("  (from cache)")
+            print("  (from Redis cache)")
             return json.loads(cached)
 
-        # Query Neo4j
-        with self.neo4j_driver.session() as session:
-            query = """
-            MATCH (d:Disease {id: $disease_id})
-            OPTIONAL MATCH (d)<-[r1]-(c:Compound)
-            WHERE type(r1) IN ['CtD', 'CpD']
-            OPTIONAL MATCH (d)-[r2]->(g:Gene)
-            WHERE type(r2) IN ['DaG', 'DuG', 'DdG']
-            OPTIONAL MATCH (d)-[:DlA]->(a:Anatomy)
-            RETURN d.name AS disease_name,
-                   collect(DISTINCT c.name) AS drugs,
-                   collect(DISTINCT g.name) AS genes,
-                   collect(DISTINCT a.name) AS anatomies
-            """
+        print("  (from MongoDB)")
 
-            result = session.run(query, disease_id=disease_id)
-            record = result.single()
+        # Query MongoDB
+        nodes_collection = self.mongo_db["nodes"]
+        edges_collection = self.mongo_db["edges"]
 
-            if not record:
-                return None
+        # Get disease info
+        disease = nodes_collection.find_one({"id": disease_id})
+        if not disease:
+            return None
 
-            profile = {
-                "disease_id": disease_id,
-                "disease_name": record["disease_name"],
-                "drugs": [d for d in record["drugs"] if d],
-                "genes": [g for g in record["genes"] if g],
-                "anatomies": [a for a in record["anatomies"] if a],
-            }
+        # Get treating drugs (CtD or CpD relationships)
+        drug_edges = edges_collection.find(
+            {"target": disease_id, "metaedge": {"$in": ["CtD", "CpD"]}}
+        )
 
-            # Cache the result
-            self.redis_client.set(cache_key, json.dumps(profile))
+        drug_ids = [edge["source"] for edge in drug_edges]
+        drugs = list(
+            nodes_collection.find({"id": {"$in": drug_ids}}, {"name": 1, "_id": 0})
+        )
 
-            return profile
+        # Get associated genes (DaG, DuG, DdG relationships)
+        gene_edges = edges_collection.find(
+            {"source": disease_id, "metaedge": {"$in": ["DaG", "DuG", "DdG"]}}
+        )
+
+        gene_ids = [edge["target"] for edge in gene_edges]
+        genes = list(
+            nodes_collection.find({"id": {"$in": gene_ids}}, {"name": 1, "_id": 0})
+        )
+
+        # Get anatomical locations (DlA relationships)
+        anatomy_edges = edges_collection.find({"source": disease_id, "metaedge": "DlA"})
+
+        anatomy_ids = [edge["target"] for edge in anatomy_edges]
+        anatomies = list(
+            nodes_collection.find({"id": {"$in": anatomy_ids}}, {"name": 1, "_id": 0})
+        )
+
+        # Build result
+        profile = {
+            "disease_id": disease_id,
+            "disease_name": disease.get("name"),
+            "drugs": [d["name"] for d in drugs],
+            "genes": [g["name"] for g in genes],
+            "anatomies": [a["name"] for a in anatomies],
+        }
+
+        # Cache the result
+        self.redis_client.set(cache_key, json.dumps(profile))
+
+        return profile
 
     def query2_drug_repurposing(self, disease_id):
         """
-        Query 2: Find compounds that could treat a disease through
-        indirect pathways (opposite regulation of genes at disease locations)
+        Query 2: Drug Repurposing
+        Uses MongoDB with multi-step queries
         """
 
         # Check Redis cache
@@ -68,35 +84,75 @@ class QueryEngine:
         cached = self.redis_client.get(cache_key)
 
         if cached:
-            print("  (from cache)")
+            print("  (from Redis cache)")
             return json.loads(cached)
 
-        # Query Neo4j
-        with self.neo4j_driver.session() as session:
-            query = """
-            MATCH (d:Disease {id: $disease_id})-[:DlA]->(a:Anatomy)
-            MATCH (c:Compound)-[r1]->(g:Gene)<-[r2]-(a)
-            WHERE (
-                (type(r1) = 'CuG' AND type(r2) IN ['AdG']) OR
-                (type(r1) = 'CdG' AND type(r2) IN ['AuG'])
+        print("  (from MongoDB)")
+
+        nodes_collection = self.mongo_db["nodes"]
+        edges_collection = self.mongo_db["edges"]
+
+        # Step 1: Get anatomies where disease occurs (Disease -DlA-> Anatomy)
+        anatomy_edges = edges_collection.find({"source": disease_id, "metaedge": "DlA"})
+        anatomy_ids = [edge["target"] for edge in anatomy_edges]
+
+        if not anatomy_ids:
+            return []
+
+        # Step 2: Get genes that anatomies regulate (Anatomy -AdG/AuG-> Gene)
+        anatomy_gene_edges = list(
+            edges_collection.find(
+                {"source": {"$in": anatomy_ids}, "metaedge": {"$in": ["AdG", "AuG"]}}
             )
-            AND NOT EXISTS((c)-[:CtD|CpD]->(d))
-            RETURN DISTINCT c.id AS compound_id, c.name AS compound_name
-            ORDER BY c.name
-            """
+        )
 
-            result = session.run(query, disease_id=disease_id)
+        # Step 3: Find compounds with opposite regulation
+        candidates = set()
 
-            candidates = []
-            for record in result:
-                candidates.append(
+        for ag_edge in anatomy_gene_edges:
+            gene_id = ag_edge["target"]
+            anatomy_regulation = ag_edge["metaedge"]  # 'AdG' or 'AuG'
+
+            # Find compounds that regulate this gene in OPPOSITE way
+            if anatomy_regulation == "AdG":
+                # Anatomy down-regulates, find compounds that UP-regulate
+                compound_edges = edges_collection.find(
+                    {"target": gene_id, "metaedge": "CuG"}
+                )
+            else:  # anatomy_regulation == 'AuG'
+                # Anatomy up-regulates, find compounds that DOWN-regulate
+                compound_edges = edges_collection.find(
+                    {"target": gene_id, "metaedge": "CdG"}
+                )
+
+            for comp_edge in compound_edges:
+                compound_id = comp_edge["source"]
+
+                # Check this compound doesn't already treat the disease
+                existing_treatment = edges_collection.find_one(
                     {
-                        "compound_id": record["compound_id"],
-                        "compound_name": record["compound_name"],
+                        "source": compound_id,
+                        "target": disease_id,
+                        "metaedge": {"$in": ["CtD", "CpD"]},
                     }
                 )
 
-            # Cache the result
-            self.redis_client.set(cache_key, json.dumps(candidates))
+                if not existing_treatment:
+                    candidates.add(compound_id)
 
-            return candidates
+        # Get compound names
+        result = []
+        for compound_id in candidates:
+            compound = nodes_collection.find_one({"id": compound_id})
+            if compound:
+                result.append(
+                    {"compound_id": compound_id, "compound_name": compound["name"]}
+                )
+
+        # Sort by name
+        result.sort(key=lambda x: x["compound_name"])
+
+        # Cache the result
+        self.redis_client.set(cache_key, json.dumps(result))
+
+        return result

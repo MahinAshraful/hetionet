@@ -6,14 +6,15 @@ from queries import QueryEngine
 def print_banner():
     print("\n" + "=" * 60)
     print("  HetioNet Database System")
+    print("  MongoDB + Redis")
     print("=" * 60 + "\n")
 
 
 def print_menu():
     print("\nCommands:")
-    print("  1. setup      - Clear and load data into databases")
-    print("  2. query1     - Disease profile query")
-    print("  3. query2     - Drug repurposing query")
+    print("  1. setup      - Clear and load data")
+    print("  2. query1     - Disease profile")
+    print("  3. query2     - Drug repurposing")
     print("  4. exit       - Exit the program")
     print()
 
@@ -28,7 +29,6 @@ def setup_database(db_manager):
 
     db_manager.clear_databases()
     db_manager.load_data()
-    db_manager.create_indexes()
     print("\n✓ Setup complete!")
 
 
@@ -56,7 +56,7 @@ def run_query1(query_engine):
 
     print(f"\nAssociated Genes ({len(result['genes'])}):")
     if result["genes"]:
-        for gene in result["genes"][:10]:  # Show first 10
+        for gene in result["genes"][:10]:
             print(f"  • {gene}")
         if len(result["genes"]) > 10:
             print(f"  ... and {len(result['genes']) - 10} more")
@@ -85,7 +85,7 @@ def run_query2(query_engine):
     print("=" * 60 + "\n")
 
     if results:
-        for i, compound in enumerate(results[:20], 1):  # Show first 20
+        for i, compound in enumerate(results[:20], 1):
             print(f"{i:2d}. {compound['compound_name']} ({compound['compound_id']})")
 
         if len(results) > 20:
@@ -102,10 +102,10 @@ def main():
     # Initialize database connections
     try:
         db_manager = DatabaseManager()
-        query_engine = QueryEngine(db_manager.neo4j_driver, db_manager.redis_client)
+        query_engine = QueryEngine(db_manager)
     except Exception as e:
         print(f"Error connecting to databases: {e}")
-        print("\nMake sure Neo4j and Redis are running!")
+        print("\nMake sure MongoDB and Redis are running!")
         sys.exit(1)
 
     # Main loop
